@@ -71,7 +71,7 @@ func connectAndSend(url string, id int, wg *sync.WaitGroup) {
 }
 
 func main() {
-	numConnections := 50 // Default number of connections
+	numConnections := 10 // Default number of connections
 	if len(os.Args) > 1 {
 		var err error
 		numConnections, err = strconv.Atoi(os.Args[1])
@@ -80,7 +80,7 @@ func main() {
 		}
 	}
 	fmt.Println("connecting...")
-	url := "ws://shailxeta-lor-lb-2093919390.us-west-2.elb.amazonaws.com/ws"
+	url := "ws://127.0.0.1:8080/ws"
 	if len(os.Args) > 2 {
 		url = os.Args[2]
 	}

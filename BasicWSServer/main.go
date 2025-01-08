@@ -2,12 +2,15 @@ package main
 
 import (
 	"fmt"
-	"log"
-	"net/http"
-
 	"github.com/gorilla/mux" // Added for routing
 	"github.com/gorilla/websocket"
+	"log"
+	"net/http"
+	"runtime"
 )
+
+var activeConnection int
+var loadSheddingThreshold uint64 = 60
 
 var upgrader = websocket.Upgrader{
 	ReadBufferSize:  1024,
@@ -18,11 +21,18 @@ var upgrader = websocket.Upgrader{
 }
 
 func handleConnections(w http.ResponseWriter, r *http.Request) {
+	if !checkMemoryUsage() {
+		http.Error(w, "Service Unavailable", http.StatusServiceUnavailable)
+		fmt.Printf("Memory load shedder: Dropping request - %v\n", r)
+		return
+	}
+
 	ws, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		log.Fatal(err)
 	}
 	defer ws.Close()
+	activeConnection++
 
 	for {
 		messageType, p, err := ws.ReadMessage()
@@ -37,6 +47,13 @@ func handleConnections(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+}
+
+func checkMemoryUsage() bool {
+	var memStats runtime.MemStats
+	runtime.ReadMemStats(&memStats)
+	return memStats.Alloc <= memStats.Sys*(loadSheddingThreshold/100)
+	//return activeConnection < 5
 }
 
 func healthCheck(w http.ResponseWriter, r *http.Request) {

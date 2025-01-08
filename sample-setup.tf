@@ -31,7 +31,7 @@ resource "aws_subnet" "ing_public" {
   }
 }
 
-data "aws_availability_zones" {
+data "aws_availability_zones" "available" {
   state = "available"
 }
 
@@ -190,8 +190,9 @@ resource "aws_iam_role" "ing_ecs_task_execution_role" {
 }
 
 resource "aws_iam_policy_attachment" "ing_ecs_task_execution_policy_attachment" {
+  name       = "ing_ecs_task_execution_policy_attachment"  # Add a descriptive name
   policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
-  role       = aws_iam_role.ing_ecs_task_execution_role.name
+  roles      = aws_iam_role.ing_ecs_task_execution_role.name
 }
 
 resource "aws_iam_role" "ing_ecs_task_role" {
