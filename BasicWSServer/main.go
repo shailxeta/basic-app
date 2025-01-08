@@ -7,10 +7,12 @@ import (
 	"log"
 	"net/http"
 	"runtime"
+	"sync/atomic"
+	"time"
 )
 
-var activeConnection int
-var loadSheddingThreshold uint64 = 60
+var activeConnection int32 // Using atomic int32 for thread-safe operations
+var loadSheddingThreshold uint64 = 70
 
 var upgrader = websocket.Upgrader{
 	ReadBufferSize:  1024,
@@ -20,10 +22,25 @@ var upgrader = websocket.Upgrader{
 	},
 }
 
+func init() {
+	// Start a goroutine to log memory utilization and connection count
+	go func() {
+		ticker := time.NewTicker(10 * time.Second)
+		for range ticker.C {
+			var memStats runtime.MemStats
+			runtime.ReadMemStats(&memStats)
+			memoryUtilizationPercent := (memStats.Alloc * 100) / memStats.Sys
+			connections := logConnectionCount()
+			fmt.Printf("Memory utilization: %d%%, Active connections: %d\n",
+				memoryUtilizationPercent, connections)
+		}
+	}()
+}
+
 func handleConnections(w http.ResponseWriter, r *http.Request) {
 	if !checkMemoryUsage() {
 		http.Error(w, "Service Unavailable", http.StatusServiceUnavailable)
-		fmt.Printf("Memory load shedder: Dropping request - %v\n", r)
+		fmt.Printf("Memory load shedder: Dropping request - %v\n", r.RemoteAddr)
 		return
 	}
 
@@ -32,8 +49,8 @@ func handleConnections(w http.ResponseWriter, r *http.Request) {
 		log.Fatal(err)
 	}
 	defer ws.Close()
-	activeConnection++
-
+	incrementConnections()
+	defer decrementConnections()
 	for {
 		messageType, p, err := ws.ReadMessage()
 		if err != nil {
@@ -50,10 +67,27 @@ func handleConnections(w http.ResponseWriter, r *http.Request) {
 }
 
 func checkMemoryUsage() bool {
+	// Memory load shedding check
 	var memStats runtime.MemStats
 	runtime.ReadMemStats(&memStats)
-	return memStats.Alloc <= memStats.Sys*(loadSheddingThreshold/100)
-	//return activeConnection < 5
+	memoryUtilizationPercent := (memStats.Alloc * 100) / memStats.Sys
+
+	if memoryUtilizationPercent > loadSheddingThreshold {
+		return false
+	}
+	return true
+}
+
+func logConnectionCount() int32 {
+	return atomic.LoadInt32(&activeConnection)
+}
+
+func incrementConnections() {
+	atomic.AddInt32(&activeConnection, 1)
+}
+
+func decrementConnections() {
+	atomic.AddInt32(&activeConnection, -1)
 }
 
 func healthCheck(w http.ResponseWriter, r *http.Request) {

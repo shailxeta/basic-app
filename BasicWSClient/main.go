@@ -18,9 +18,9 @@ func connectAndSend(url string, id int, wg *sync.WaitGroup) {
 	interrupt := make(chan os.Signal, 1)
 	signal.Notify(interrupt, os.Interrupt)
 
-	c, _, err := websocket.DefaultDialer.Dial(url, nil)
+	c, resp, err := websocket.DefaultDialer.Dial(url, nil)
 	if err != nil {
-		log.Printf("dial %d: %v", id, err)
+		log.Printf("dial %d: %v (status: %d)", id, err, resp.StatusCode)
 		return
 	}
 	defer c.Close()
@@ -32,7 +32,11 @@ func connectAndSend(url string, id int, wg *sync.WaitGroup) {
 		for {
 			_, message, err := c.ReadMessage()
 			if err != nil {
-				log.Printf("read %d: %v", id, err)
+				if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
+					log.Printf("read %d: unexpected close error: %v", id, err)
+				} else {
+					log.Printf("read %d: %v", id, err)
+				}
 				return
 			}
 			log.Printf("recv %d: %s", id, message)
@@ -45,14 +49,17 @@ func connectAndSend(url string, id int, wg *sync.WaitGroup) {
 	for {
 		select {
 		case <-done:
+			if closeErr := c.CloseHandler()(websocket.CloseAbnormalClosure, ""); closeErr != nil {
+				log.Printf("connection %d closed abnormally: %v", id, closeErr)
+			}
 			return
 		case <-ticker.C:
-			message := fmt.Sprintf("hello from client %d", id)
-			err := c.WriteMessage(websocket.TextMessage, []byte(message))
-			if err != nil {
-				log.Printf("write %d: %v", id, err)
-				return
-			}
+			//message := fmt.Sprintf("hello from client %d", id)
+			//err := c.WriteMessage(websocket.TextMessage, []byte(message))
+			//if err != nil {
+			//	log.Printf("write %d: %v", id, err)
+			//	return
+			//}
 		case <-interrupt:
 			log.Printf("interrupt %d", id)
 
@@ -71,7 +78,7 @@ func connectAndSend(url string, id int, wg *sync.WaitGroup) {
 }
 
 func main() {
-	numConnections := 10 // Default number of connections
+	numConnections := 4000 // Default number of connections
 	if len(os.Args) > 1 {
 		var err error
 		numConnections, err = strconv.Atoi(os.Args[1])
