@@ -6,13 +6,20 @@ import (
 	"github.com/gorilla/websocket"
 	"log"
 	"net/http"
+	"os"
 	"runtime"
 	"sync/atomic"
 	"time"
 )
 
 var activeConnection int32 // Using atomic int32 for thread-safe operations
-var loadSheddingThreshold uint64 = 70
+var loadSheddingThreshold uint64 = 50
+var droppedRequests int32
+var cummulativeDroppedRequests int64
+var lastDroppedRequestLog time.Time
+var hostname, _ = os.Hostname()
+
+const statsLogDuration = 10
 
 var upgrader = websocket.Upgrader{
 	ReadBufferSize:  1024,
@@ -25,14 +32,30 @@ var upgrader = websocket.Upgrader{
 func init() {
 	// Start a goroutine to log memory utilization and connection count
 	go func() {
-		ticker := time.NewTicker(10 * time.Second)
+		ticker := time.NewTicker(statsLogDuration * time.Second)
 		for range ticker.C {
 			var memStats runtime.MemStats
 			runtime.ReadMemStats(&memStats)
 			memoryUtilizationPercent := (memStats.Alloc * 100) / memStats.Sys
 			connections := logConnectionCount()
-			fmt.Printf("Memory utilization: %d%%, Active connections: %d\n",
-				memoryUtilizationPercent, connections)
+			// Get CPU utilization percentage
+			// Get an estimate of CPU usage by sampling over a short interval
+			var cpuUsage float64
+			startTime := time.Now()
+			startCPU := runtime.NumCPU()
+			time.Sleep(100 * time.Millisecond) // Sample for 100ms
+			duration := time.Since(startTime).Seconds()
+			cpuUsage = float64(runtime.NumGoroutine()) / (float64(startCPU) * duration) * 100
+			if cpuUsage > 100 {
+				cpuUsage = 100
+			}
+			log.Printf("Hostname: %s - Stats - Memory utilization: %d%%, CPU utilization: %f, Active connections: %d, Dropped requests %d, Cumulative Dropped Requests: %d",
+				hostname, memoryUtilizationPercent, cpuUsage, connections, droppedRequests, cummulativeDroppedRequests)
+			atomic.StoreInt32(&droppedRequests, 0) // Reset counter
+			// Reset cumulative dropped requests if it exceeds int64 range to prevent overflow
+			if atomic.LoadInt64(&cummulativeDroppedRequests) > (1<<63 - 1000000) {
+				atomic.StoreInt64(&cummulativeDroppedRequests, 0)
+			}
 		}
 	}()
 }
@@ -40,7 +63,8 @@ func init() {
 func handleConnections(w http.ResponseWriter, r *http.Request) {
 	if !checkMemoryUsage() {
 		http.Error(w, "Service Unavailable", http.StatusServiceUnavailable)
-		fmt.Printf("Memory load shedder: Dropping request - %v\n", r.RemoteAddr)
+		atomic.AddInt32(&droppedRequests, 1) // Increment dropped request counter
+		atomic.AddInt64(&cummulativeDroppedRequests, 1)
 		return
 	}
 
@@ -54,13 +78,13 @@ func handleConnections(w http.ResponseWriter, r *http.Request) {
 	for {
 		messageType, p, err := ws.ReadMessage()
 		if err != nil {
-			log.Println(err)
+			//log.Printf("HostName: %s, error: %s", hostname, err)
 			return
 		}
-		fmt.Printf("Message Received: %s\n", p)
+		//log.Printf("Hostname: %s - Message Received: %s", hostname, p)
 
 		if err := ws.WriteMessage(messageType, p); err != nil {
-			log.Println(err)
+			//log.Printf("Hostname: %s - Error: %s", hostname, err)
 			return
 		}
 	}
@@ -100,6 +124,6 @@ func main() {
 	router.HandleFunc("/ws", handleConnections)
 	router.HandleFunc("/health", healthCheck) // Add health check endpoint
 
-	fmt.Println("Server listening on :8080")
+	log.Printf("Hostname: %s - Server listening on :8080", hostname)
 	log.Fatal(http.ListenAndServe(":8080", router))
 }

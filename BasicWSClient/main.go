@@ -18,67 +18,80 @@ func connectAndSend(url string, id int, wg *sync.WaitGroup) {
 	interrupt := make(chan os.Signal, 1)
 	signal.Notify(interrupt, os.Interrupt)
 
-	c, resp, err := websocket.DefaultDialer.Dial(url, nil)
-	if err != nil {
-		log.Printf("dial %d: %v (status: %d)", id, err, resp.StatusCode)
-		return
-	}
-	defer c.Close()
-
-	done := make(chan struct{})
-
-	go func() {
-		defer close(done)
-		for {
-			_, message, err := c.ReadMessage()
-			if err != nil {
-				if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
-					log.Printf("read %d: unexpected close error: %v", id, err)
-				} else {
-					log.Printf("read %d: %v", id, err)
-				}
-				return
-			}
-			log.Printf("recv %d: %s", id, message)
-		}
-	}()
-
-	ticker := time.NewTicker(5 * time.Second) // Send "hello" every 5 seconds
-	defer ticker.Stop()
-
 	for {
-		select {
-		case <-done:
-			if closeErr := c.CloseHandler()(websocket.CloseAbnormalClosure, ""); closeErr != nil {
-				log.Printf("connection %d closed abnormally: %v", id, closeErr)
+		c, resp, err := websocket.DefaultDialer.Dial(url, nil)
+		if err != nil {
+			if resp != nil { // Check if resp is not nil before accessing StatusCode
+				log.Printf("dial %d: %v (status: %d), retrying in 5 seconds...", id, err, resp.StatusCode)
+			} else {
+				log.Printf("dial %d: %v, retrying in 5 seconds...", id, err) // Handle nil resp
 			}
-			return
-		case <-ticker.C:
-			//message := fmt.Sprintf("hello from client %d", id)
-			//err := c.WriteMessage(websocket.TextMessage, []byte(message))
-			//if err != nil {
-			//	log.Printf("write %d: %v", id, err)
-			//	return
-			//}
-		case <-interrupt:
-			log.Printf("interrupt %d", id)
-
-			err := c.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""))
-			if err != nil {
-				log.Printf("write close %d: %v", id, err)
-				return
-			}
-			select {
-			case <-done:
-			case <-time.After(time.Second):
-			}
-			return
+			time.Sleep(5 * time.Second)
+			continue // Retry connection on error
 		}
+
+		done := make(chan struct{})
+
+		go func() {
+			defer close(done)
+			for {
+				_, message, err := c.ReadMessage()
+				if err != nil {
+					if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
+						log.Printf("read %d: unexpected close error: %v", id, err)
+					} else {
+						log.Printf("read %d: %v", id, err)
+					}
+					return
+				}
+				log.Printf("recv %d: %s", id, message)
+			}
+		}()
+
+		ticker := time.NewTicker(5 * time.Second) // Send "hello" every 5 seconds
+
+		func() {
+			defer ticker.Stop()
+			defer c.Close()
+
+		loop:
+			for {
+				select {
+				case <-done:
+					if closeErr := c.CloseHandler()(websocket.CloseAbnormalClosure, ""); closeErr != nil {
+						log.Printf("connection %d closed abnormally: %v", id, closeErr)
+					}
+					break loop
+				case <-ticker.C:
+					message := fmt.Sprintf("hello from client %d", id)
+					err := c.WriteMessage(websocket.TextMessage, []byte(message))
+					if err != nil {
+						log.Printf("write %d: %v", id, err)
+						break loop // Break loop and retry on error
+					}
+				case <-interrupt:
+					log.Printf("interrupt %d", id)
+
+					err := c.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""))
+					if err != nil {
+						log.Printf("write close %d: %v", id, err)
+					}
+					select {
+					case <-done:
+					case <-time.After(time.Second):
+					}
+					break loop
+				}
+			}
+		}()
+
+		log.Printf("Connection %d lost, reconnecting...", id)
+		time.Sleep(time.Second) // Wait a bit before reconnecting
 	}
 }
 
 func main() {
-	numConnections := 4000 // Default number of connections
+	numConnections := 1000 // Default number of connections
 	if len(os.Args) > 1 {
 		var err error
 		numConnections, err = strconv.Atoi(os.Args[1])
