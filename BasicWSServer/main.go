@@ -119,11 +119,22 @@ func healthCheck(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, "OK")
 }
 
+func healthCheckWithLoadShedding(w http.ResponseWriter, r *http.Request) {		
+	if checkMemoryUsage() {
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprintf(w, "OK")
+		return
+	}
+	w.WriteHeader(http.StatusServiceUnavailable)
+	fmt.Fprintf(w, "Service Unavailable")
+}
+
+
 func main() {
 	router := mux.NewRouter() // Use a router for cleaner URL handling
 	router.HandleFunc("/ws", handleConnections)
 	router.HandleFunc("/health", healthCheck) // Add health check endpoint
-
+	router.HandleFunc("/loadshedding", healthCheckWithLoadShedding)
 	log.Printf("Hostname: %s - Server listening on :8080", hostname)
 	log.Fatal(http.ListenAndServe(":8080", router))
 }
