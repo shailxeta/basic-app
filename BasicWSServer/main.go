@@ -115,6 +115,7 @@ func decrementConnections() {
 }
 
 func healthCheck(w http.ResponseWriter, r *http.Request) {
+	log.Printf("Health check request received...")
 	w.WriteHeader(http.StatusOK) // Respond with 200 for healthy status
 	fmt.Fprintf(w, "OK")
 }
