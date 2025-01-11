@@ -100,7 +100,7 @@ func main() {
 		}
 	}
 	fmt.Println("connecting...")
-	url := "ws://shailxeta-lor-lb-2093919390.us-west-2.elb.amazonaws.com/ws"
+	url := "ws://<lb_name>.us-west-2.elb.amazonaws.com/ws"
 	if len(os.Args) > 2 {
 		url = os.Args[2]
 	}
