@@ -197,6 +197,7 @@ func main() {
 		}
 	}
 
+	fmt.Println("connecting...")
 	url := "ws://localhost:8080/ws"
 	if len(os.Args) > 2 {
 		url = os.Args[2]
