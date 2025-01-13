@@ -115,12 +115,12 @@ func decrementConnections() {
 }
 
 func healthCheck(w http.ResponseWriter, r *http.Request) {
-	log.Printf("Health check request received...")
+	//log.Printf("HostName: %s - Health check request received...", hostname)
 	w.WriteHeader(http.StatusOK) // Respond with 200 for healthy status
 	fmt.Fprintf(w, "OK")
 }
 
-func healthCheckWithLoadShedding(w http.ResponseWriter, r *http.Request) {		
+func healthCheckWithLoadShedding(w http.ResponseWriter, r *http.Request) {
 	if checkMemoryUsage() {
 		w.WriteHeader(http.StatusOK)
 		fmt.Fprintf(w, "OK")
@@ -129,7 +129,6 @@ func healthCheckWithLoadShedding(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusServiceUnavailable)
 	fmt.Fprintf(w, "Service Unavailable")
 }
-
 
 func main() {
 	router := mux.NewRouter() // Use a router for cleaner URL handling

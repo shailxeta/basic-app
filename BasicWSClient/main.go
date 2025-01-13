@@ -1,8 +1,10 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
 	"os/signal"
 	"strconv"
@@ -12,86 +14,181 @@ import (
 	"github.com/gorilla/websocket"
 )
 
-func connectAndSend(url string, id int, wg *sync.WaitGroup) {
-	defer wg.Done()
+type WSClient struct {
+	url         string
+	id          int
+	conn        *websocket.Conn
+	done        chan struct{}
+	interrupt   chan os.Signal
+	ticker      *time.Ticker
+	retryDelay  time.Duration
+	retryCount  int
+	maxRetries  int
+	originalURL string
+	isClosed    bool
+	mu          sync.Mutex // Mutex to protect isClosed
+}
 
-	interrupt := make(chan os.Signal, 1)
-	signal.Notify(interrupt, os.Interrupt)
+func NewWSClient(url string, id int) *WSClient {
+	return &WSClient{
+		url:         url,
+		originalURL: url,
+		id:          id,
+		done:        make(chan struct{}),
+		interrupt:   make(chan os.Signal, 1),
+		retryDelay:  5 * time.Second,
+		maxRetries:  3,
+		isClosed:    false,
+	}
+}
+
+func (c *WSClient) handleRedirect() (*websocket.Conn, *http.Response, error) {
+	conn, resp, err := websocket.DefaultDialer.Dial(c.url, nil)
+	if err != nil && resp != nil {
+		if resp.StatusCode == http.StatusTemporaryRedirect ||
+			resp.StatusCode == http.StatusMovedPermanently ||
+			resp.StatusCode == http.StatusFound {
+			redirectURL := resp.Header.Get("Location")
+			if redirectURL != "" {
+				log.Printf("Following redirect to: %s", redirectURL)
+				return websocket.DefaultDialer.Dial(redirectURL, nil)
+			}
+		}
+	}
+	return conn, resp, err
+}
+
+func (c *WSClient) connect() error {
+	var resp *http.Response
+	var err error
+
+	c.conn, resp, err = c.handleRedirect()
+	if err != nil {
+		if resp != nil {
+			return fmt.Errorf("dial %d: %v (status: %d)", c.id, err, resp.StatusCode)
+		}
+		return fmt.Errorf("dial %d: %v", c.id, err)
+	}
+	return nil
+}
+
+func (c *WSClient) closeOnce() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !c.isClosed {
+		close(c.done)
+		c.isClosed = true
+	}
+}
+
+func (c *WSClient) readPump() {
+	defer c.closeOnce()
+	for {
+		_, message, err := c.conn.ReadMessage()
+		if err != nil {
+			if websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
+				log.Printf("client %d: connection closed normally", c.id)
+			} else if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
+				log.Printf("read %d: unexpected close error: %v", c.id, err)
+			} else {
+				var netErr *websocket.CloseError
+				if errors.As(err, &netErr) {
+					log.Printf("read %d: websocket close error: %v", c.id, netErr)
+				}
+			}
+			return
+		}
+		log.Printf("recv %d: %s", c.id, message)
+	}
+}
+
+func (c *WSClient) writePump() error {
+	message := fmt.Sprintf("hello from client %d", c.id)
+	return c.conn.WriteMessage(websocket.TextMessage, []byte(message))
+}
+
+func (c *WSClient) cleanup() {
+	if c.ticker != nil {
+		c.ticker.Stop()
+	}
+	// Close connection after stopping ticker
+	if c.conn != nil {
+		// Attempt graceful closure first
+		c.conn.WriteMessage(websocket.CloseMessage,
+			websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""))
+		c.conn.Close()
+	}
+}
+
+func (c *WSClient) Run(wg *sync.WaitGroup) {
+	defer wg.Done()
+	signal.Notify(c.interrupt, os.Interrupt)
 
 	for {
-		c, resp, err := websocket.DefaultDialer.Dial(url, nil)
-		if err != nil {
-			if resp != nil { // Check if resp is not nil before accessing StatusCode
-				log.Printf("dial %d: %v (status: %d), retrying in 5 seconds...", id, err, resp.StatusCode)
-			} else {
-				log.Printf("dial %d: %v, retrying in 5 seconds...", id, err) // Handle nil resp
+		// Reset done channel and isClosed flag for new connection attempt
+		c.mu.Lock()
+		if c.isClosed {
+			c.done = make(chan struct{})
+			c.isClosed = false
+		}
+		c.mu.Unlock()
+
+		if err := c.connect(); err != nil {
+			log.Printf("%v, retrying in %v...", err, c.retryDelay)
+			c.retryCount++
+
+			if c.retryCount >= c.maxRetries {
+				log.Printf("Retry count exceeded for client %d, reconnecting to proxy...", c.id)
+				c.url = c.originalURL
+				c.retryCount = 0
 			}
-			time.Sleep(5 * time.Second)
-			continue // Retry connection on error
+
+			time.Sleep(c.retryDelay)
+			continue
 		}
 
-		done := make(chan struct{})
+		c.retryCount = 0
+		c.ticker = time.NewTicker(5 * time.Second)
+		go c.readPump()
 
-		go func() {
-			defer close(done)
-			for {
-				_, message, err := c.ReadMessage()
+	loop:
+		for {
+			select {
+			case <-c.done:
+				if closeErr := c.conn.CloseHandler()(websocket.CloseAbnormalClosure, ""); closeErr != nil {
+					log.Printf("connection %d closed abnormally: %v", c.id, closeErr)
+				}
+				break loop
+
+			case <-c.ticker.C:
+				if err := c.writePump(); err != nil {
+					log.Printf("write %d: %v", c.id, err)
+					break loop
+				}
+
+			case <-c.interrupt:
+				log.Printf("interrupt %d", c.id)
+				err := c.conn.WriteMessage(websocket.CloseMessage,
+					websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""))
 				if err != nil {
-					if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
-						log.Printf("read %d: unexpected close error: %v", id, err)
-					} else {
-						log.Printf("read %d: %v", id, err)
-					}
-					return
+					log.Printf("write close %d: %v", c.id, err)
 				}
-				log.Printf("recv %d: %s", id, message)
-			}
-		}()
-
-		ticker := time.NewTicker(5 * time.Second) // Send "hello" every 5 seconds
-
-		func() {
-			defer ticker.Stop()
-			defer c.Close()
-
-		loop:
-			for {
 				select {
-				case <-done:
-					if closeErr := c.CloseHandler()(websocket.CloseAbnormalClosure, ""); closeErr != nil {
-						log.Printf("connection %d closed abnormally: %v", id, closeErr)
-					}
-					break loop
-				case <-ticker.C:
-					message := fmt.Sprintf("hello from client %d", id)
-					err := c.WriteMessage(websocket.TextMessage, []byte(message))
-					if err != nil {
-						log.Printf("write %d: %v", id, err)
-						break loop // Break loop and retry on error
-					}
-				case <-interrupt:
-					log.Printf("interrupt %d", id)
-
-					err := c.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""))
-					if err != nil {
-						log.Printf("write close %d: %v", id, err)
-					}
-					select {
-					case <-done:
-					case <-time.After(time.Second):
-					}
-					break loop
+				case <-c.done:
+				case <-time.After(time.Second):
 				}
+				return
 			}
-		}()
+		}
 
-		log.Printf("Connection %d lost, reconnecting...", id)
-		time.Sleep(time.Second) // Wait a bit before reconnecting
+		c.cleanup()
+		log.Printf("Connection %d lost, reconnecting...", c.id)
+		time.Sleep(time.Second)
 	}
 }
 
 func main() {
-	numConnections := 1000 // Default number of connections
+	numConnections := 5
 	if len(os.Args) > 1 {
 		var err error
 		numConnections, err = strconv.Atoi(os.Args[1])
@@ -99,16 +196,18 @@ func main() {
 			log.Fatal("Invalid number of connections:", err)
 		}
 	}
-	fmt.Println("connecting...")
-	url := "ws://shailxeta-lor-lb-2093919390.us-west-2.elb.amazonaws.com/ws"
+
+	url := "ws://localhost:8080/ws"
 	if len(os.Args) > 2 {
 		url = os.Args[2]
 	}
 
+	fmt.Println("connecting...")
 	var wg sync.WaitGroup
 	for i := 1; i <= numConnections; i++ {
 		wg.Add(1)
-		go connectAndSend(url, i, &wg)
+		client := NewWSClient(url, i)
+		go client.Run(&wg)
 	}
 
 	wg.Wait()
