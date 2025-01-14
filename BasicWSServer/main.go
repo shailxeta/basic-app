@@ -2,25 +2,43 @@ package main
 
 import (
 	"fmt"
-	"github.com/gorilla/mux" // Added for routing
-	"github.com/gorilla/websocket"
 	"log"
 	"net/http"
 	"os"
 	"runtime"
+	"strings"
 	"sync/atomic"
 	"time"
+
+	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go/aws/session"
+	"github.com/aws/aws-sdk-go/service/servicediscovery"
+	"github.com/gorilla/mux"
+	"github.com/gorilla/websocket"
 )
 
-var activeConnection int32 // Using atomic int32 for thread-safe operations
-var loadSheddingThreshold uint64 = 50
-var droppedRequests int32
-var cummulativeDroppedRequests int64
-var lastDroppedRequestLog time.Time
-var hostname, _ = os.Hostname()
+// Constants
+const (
+	statsLogDuration      = 10
+	loadSheddingThreshold = 50
+)
 
-const statsLogDuration = 10
+// Global variables
+var (
+	activeConnection           int32 // Using atomic int32 for thread-safe operations
+	droppedRequests            int32
+	cummulativeDroppedRequests int64
+	lastDroppedRequestLog      time.Time
+	hostname, _                = os.Hostname()
 
+	// AWS Service Discovery related
+	serviceDiscoveryClient *servicediscovery.ServiceDiscovery
+	serviceID              string
+	instanceID             string
+	namespaceId            string
+)
+
+// WebSocket upgrader configuration
 var upgrader = websocket.Upgrader{
 	ReadBufferSize:  1024,
 	WriteBufferSize: 1024,
@@ -30,40 +48,100 @@ var upgrader = websocket.Upgrader{
 }
 
 func init() {
-	// Start a goroutine to log memory utilization and connection count
-	go func() {
-		ticker := time.NewTicker(statsLogDuration * time.Second)
-		for range ticker.C {
-			var memStats runtime.MemStats
-			runtime.ReadMemStats(&memStats)
-			memoryUtilizationPercent := (memStats.Alloc * 100) / memStats.Sys
-			connections := logConnectionCount()
-			// Get CPU utilization percentage
-			// Get an estimate of CPU usage by sampling over a short interval
-			var cpuUsage float64
-			startTime := time.Now()
-			startCPU := runtime.NumCPU()
-			time.Sleep(100 * time.Millisecond) // Sample for 100ms
-			duration := time.Since(startTime).Seconds()
-			cpuUsage = float64(runtime.NumGoroutine()) / (float64(startCPU) * duration) * 100
-			if cpuUsage > 100 {
-				cpuUsage = 100
-			}
-			log.Printf("Hostname: %s - Stats - Memory utilization: %d%%, CPU utilization: %f, Active connections: %d, Dropped requests %d, Cumulative Dropped Requests: %d",
-				hostname, memoryUtilizationPercent, cpuUsage, connections, droppedRequests, cummulativeDroppedRequests)
-			atomic.StoreInt32(&droppedRequests, 0) // Reset counter
-			// Reset cumulative dropped requests if it exceeds int64 range to prevent overflow
-			if atomic.LoadInt64(&cummulativeDroppedRequests) > (1<<63 - 1000000) {
-				atomic.StoreInt64(&cummulativeDroppedRequests, 0)
-			}
+	// Initialize AWS Service Discovery client
+	sess := session.Must(session.NewSession())
+	serviceDiscoveryClient = servicediscovery.New(sess)
+
+	// Get service and instance IDs from environment variables
+	serviceID = os.Getenv("CLOUD_MAP_SERVICE_ID")
+	namespaceId = os.Getenv("CLOUD_MAP_NAMESPACE_ID")
+	metadataURI := os.Getenv("ECS_CONTAINER_METADATA_URI_V4")
+
+	if metadataURI == "" {
+		log.Printf("Hostname: %s - ECS_CONTAINER_METADATA_URI_V4 environment variable must be set", hostname)
+	}
+
+	// Extract task ID from metadata URI - format is http://<ip>/<version>/<id>
+	parts := strings.Split(metadataURI, "/")
+	instanceID = strings.Split(parts[len(parts)-1], "-")[0] // First part before hyphen is the instance ID
+
+	if serviceID == "" || instanceID == "" {
+		log.Printf("Hostname: %s - SERVICE_ID and INSTANCE_ID environment variables must be set", hostname)
+	}
+	log.Printf("Hostname: %s - instanceId: %s, serviceId: %s", hostname, instanceID, serviceID)
+
+	// Start stats monitoring goroutine
+	go monitorStats()
+}
+
+func monitorStats() {
+	ticker := time.NewTicker(statsLogDuration * time.Second)
+	for range ticker.C {
+		var memStats runtime.MemStats
+		runtime.ReadMemStats(&memStats)
+		memoryUtilizationPercent := (memStats.Alloc * 100) / memStats.Sys
+		connections := logConnectionCount()
+
+		// Calculate CPU usage
+		cpuUsage := calculateCPUUsage()
+
+		// Update AWS Service Discovery
+		updateServiceDiscovery(connections)
+
+		// Log stats
+		log.Printf("Hostname: %s - Stats - Memory utilization: %d%%, CPU utilization: %f, Active connections: %d, Dropped requests %d, Cumulative Dropped Requests: %d",
+			hostname, memoryUtilizationPercent, cpuUsage, connections, droppedRequests, cummulativeDroppedRequests)
+
+		// Reset counters
+		atomic.StoreInt32(&droppedRequests, 0)
+		if atomic.LoadInt64(&cummulativeDroppedRequests) > (1<<63 - 1000000) {
+			atomic.StoreInt64(&cummulativeDroppedRequests, 0)
 		}
-	}()
+	}
+}
+
+func calculateCPUUsage() float64 {
+	startTime := time.Now()
+	startCPU := runtime.NumCPU()
+	time.Sleep(100 * time.Millisecond)
+	duration := time.Since(startTime).Seconds()
+	cpuUsage := float64(runtime.NumGoroutine()) / (float64(startCPU) * duration) * 100
+	if cpuUsage > 100 {
+		cpuUsage = 100
+	}
+	return cpuUsage
+}
+
+func updateServiceDiscovery(connections int32) {
+	getInstanceResp, err := serviceDiscoveryClient.GetInstance(&servicediscovery.GetInstanceInput{
+		ServiceId:  aws.String(serviceID),
+		InstanceId: aws.String(instanceID),
+	})
+	if err != nil {
+		log.Printf("Failed to get instance: %v", err)
+		return
+	}
+
+	attributes := getInstanceResp.Instance.Attributes
+	if attributes == nil {
+		attributes = make(map[string]*string)
+	}
+	attributes["ACTIVE_CONNECTIONS"] = aws.String(fmt.Sprintf("%d", connections))
+
+	_, err = serviceDiscoveryClient.RegisterInstance(&servicediscovery.RegisterInstanceInput{
+		ServiceId:  aws.String(serviceID),
+		InstanceId: aws.String(instanceID),
+		Attributes: attributes,
+	})
+	if err != nil {
+		log.Printf("Failed to update service discovery: %v", err)
+	}
 }
 
 func handleConnections(w http.ResponseWriter, r *http.Request) {
 	if !checkMemoryUsage() {
 		http.Error(w, "Service Unavailable", http.StatusServiceUnavailable)
-		atomic.AddInt32(&droppedRequests, 1) // Increment dropped request counter
+		atomic.AddInt32(&droppedRequests, 1)
 		atomic.AddInt64(&cummulativeDroppedRequests, 1)
 		return
 	}
@@ -73,33 +151,28 @@ func handleConnections(w http.ResponseWriter, r *http.Request) {
 		log.Fatal(err)
 	}
 	defer ws.Close()
+
 	incrementConnections()
 	defer decrementConnections()
+
 	for {
 		messageType, p, err := ws.ReadMessage()
 		if err != nil {
-			//log.Printf("HostName: %s, error: %s", hostname, err)
 			return
 		}
-		//log.Printf("Hostname: %s - Message Received: %s", hostname, p)
 
 		if err := ws.WriteMessage(messageType, p); err != nil {
-			//log.Printf("Hostname: %s - Error: %s", hostname, err)
 			return
 		}
 	}
 }
 
+// Helper functions
 func checkMemoryUsage() bool {
-	// Memory load shedding check
 	var memStats runtime.MemStats
 	runtime.ReadMemStats(&memStats)
 	memoryUtilizationPercent := (memStats.Alloc * 100) / memStats.Sys
-
-	if memoryUtilizationPercent > loadSheddingThreshold {
-		return false
-	}
-	return true
+	return memoryUtilizationPercent <= loadSheddingThreshold
 }
 
 func logConnectionCount() int32 {
@@ -114,9 +187,9 @@ func decrementConnections() {
 	atomic.AddInt32(&activeConnection, -1)
 }
 
+// HTTP Handlers
 func healthCheck(w http.ResponseWriter, r *http.Request) {
-	//log.Printf("HostName: %s - Health check request received...", hostname)
-	w.WriteHeader(http.StatusOK) // Respond with 200 for healthy status
+	w.WriteHeader(http.StatusOK)
 	fmt.Fprintf(w, "OK")
 }
 
@@ -131,10 +204,11 @@ func healthCheckWithLoadShedding(w http.ResponseWriter, r *http.Request) {
 }
 
 func main() {
-	router := mux.NewRouter() // Use a router for cleaner URL handling
+	router := mux.NewRouter()
 	router.HandleFunc("/ws", handleConnections)
-	router.HandleFunc("/health", healthCheck) // Add health check endpoint
-	router.HandleFunc("/loadshedding", healthCheckWithLoadShedding)
+	router.HandleFunc("/health", healthCheck)
+	router.HandleFunc("/load-shedding", healthCheckWithLoadShedding)
+
 	log.Printf("Hostname: %s - Server listening on :8080", hostname)
 	log.Fatal(http.ListenAndServe(":8080", router))
 }
