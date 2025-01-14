@@ -59,11 +59,13 @@ func (p *WSProxy) updateServiceDiscoveryCache() error {
 			connections, _ = strconv.Atoi(*val)
 		}
 
-		instances = append(instances, Instance{
-			ID:                *inst.Id,
-			Host:              *inst.Attributes["AWS_INSTANCE_IPV4"],
-			ActiveConnections: connections,
-		})
+		if publicIP, ok := inst.Attributes["INSTANCE_PUBLIC_IPV4"]; ok {
+			instances = append(instances, Instance{
+				ID:                *inst.Id,
+				Host:              *publicIP,
+				ActiveConnections: connections,
+			})
+		}
 	}
 
 	p.cacheMutex.Lock()

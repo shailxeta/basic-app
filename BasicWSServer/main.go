@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
@@ -10,6 +11,8 @@ import (
 	"strings"
 	"sync/atomic"
 	"time"
+
+	"github.com/aws/aws-sdk-go/service/ec2"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/session"
@@ -72,13 +75,6 @@ func init() {
 	}
 	log.Printf("Hostname: %s - instanceId: %s, serviceId: %s", hostname, instanceID, serviceID)
 
-	metadataURL := os.Getenv("ECS_CONTAINER_METADATA_URI_V4") + "/task"
-	resp, err := http.Get(metadataURL)
-	if err != nil {
-		log.Fatalf("failed to get task metadata: %w", err)
-	}
-	defer resp.Body.Close()
-
 	//var metadata struct {
 	//	Containers []struct {
 	//		Networks []struct {
@@ -91,11 +87,6 @@ func init() {
 	//	} `json:"Containers"`
 	//}
 
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		log.Fatalf("failed to read task metadata: %v", err)
-	}
-	log.Printf("Task metadata response: %s", string(body))
 	//if err := json.NewDecoder(resp.Body).Decode(&metadata); err != nil {
 	//	log.Fatalf("failed to decode task metadata: %w", err)
 	//}
@@ -154,7 +145,82 @@ func calculateCPUUsage() float64 {
 	return cpuUsage
 }
 
+func getPublicIPFromPrivateIP() (string, error) {
+	metadataURI := os.Getenv("ECS_CONTAINER_METADATA_URI_V4")
+	if metadataURI == "" {
+		return "", fmt.Errorf("ECS_CONTAINER_METADATA_URI_V4 environment variable is not set")
+	}
+
+	// Fetch metadata
+	resp, err := http.Get(metadataURI + "/task")
+	if err != nil {
+		return "", fmt.Errorf("failed to fetch task metadata: %v", err)
+	}
+	defer resp.Body.Close()
+
+	var metadata struct {
+		Containers []struct {
+			Networks []struct {
+				IPv4Addresses []string `json:"IPv4Addresses"`
+			} `json:"Networks"`
+		} `json:"Containers"`
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("failed to read metadata response: %v", err)
+	}
+
+	err = json.Unmarshal(body, &metadata)
+	if err != nil {
+		return "", fmt.Errorf("failed to decode task metadata: %v", err)
+	}
+
+	if len(metadata.Containers) == 0 || len(metadata.Containers[0].Networks) == 0 {
+		return "", fmt.Errorf("no network data found in metadata")
+	}
+
+	privateIP := metadata.Containers[0].Networks[0].IPv4Addresses[0]
+	if privateIP == "" {
+		return "", fmt.Errorf("no private IP found in metadata")
+	}
+
+	// Use private IP to get public IP
+	return getPublicIPFromEC2(privateIP)
+}
+
+func getPublicIPFromEC2(privateIP string) (string, error) {
+	// Initialize AWS SDK session
+	sess := session.Must(session.NewSession())
+	ec2Client := ec2.New(sess)
+
+	// Describe ENI using the private IP
+	result, err := ec2Client.DescribeNetworkInterfaces(&ec2.DescribeNetworkInterfacesInput{
+		Filters: []*ec2.Filter{
+			{
+				Name:   aws.String("addresses.private-ip-address"),
+				Values: []*string{aws.String(privateIP)},
+			},
+		},
+	})
+
+	resultJSON, _ := json.Marshal(result)
+	log.Printf("DescribeNetworkInterfaces result: %s, privateIP: %s", string(resultJSON), privateIP)
+	if err != nil {
+		return "", fmt.Errorf("failed to describe network interfaces: %v", err)
+	}
+
+	if len(result.NetworkInterfaces) == 0 || result.NetworkInterfaces[0].Association == nil {
+		return "", fmt.Errorf("no public IP found for private IP: %s", privateIP)
+	}
+
+	return *result.NetworkInterfaces[0].Association.PublicIp, nil
+}
+
 func updateServiceDiscovery(connections int32) {
+	ip, err := getPublicIPFromPrivateIP()
+	log.Printf("publicIP: %s", ip)
+
 	getInstanceResp, err := serviceDiscoveryClient.GetInstance(&servicediscovery.GetInstanceInput{
 		ServiceId:  aws.String(serviceID),
 		InstanceId: aws.String(instanceID),
@@ -169,7 +235,7 @@ func updateServiceDiscovery(connections int32) {
 		attributes = make(map[string]*string)
 	}
 	attributes["ACTIVE_CONNECTIONS"] = aws.String(fmt.Sprintf("%d", connections))
-	attributes["AWS_INSTANCE_PUBLIC_IPV4"] = aws.String(fmt.Sprintf("%d", connections))
+	attributes["INSTANCE_PUBLIC_IPV4"] = aws.String(ip)
 
 	_, err = serviceDiscoveryClient.RegisterInstance(&servicediscovery.RegisterInstanceInput{
 		ServiceId:  aws.String(serviceID),
