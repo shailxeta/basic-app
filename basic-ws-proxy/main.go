@@ -68,6 +68,7 @@ func (p *WSProxy) updateServiceDiscoveryCache() error {
 
 	p.cacheMutex.Lock()
 	p.serviceDiscoveryCache = instances
+	log.Printf("Service Discovery Cache updated - Instances: %+v", instances)
 	p.cacheMutex.Unlock()
 
 	return nil
@@ -99,7 +100,9 @@ func (p *WSProxy) proxyHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	targetURL := fmt.Sprintf("ws://%s/ws", instance.Host)
+	//log.Printf("Instance Host: %s", instance.Host)
+
+	targetURL := fmt.Sprintf("ws://%s:8080/ws", instance.Host)
 	target, err := url.Parse(targetURL)
 	if err != nil {
 		log.Printf("Failed to parse target URL: %v", err)
@@ -149,7 +152,7 @@ func (p *WSProxy) Start() error {
 }
 
 func main() {
-	proxy := NewWSProxy(":8080")
+	proxy := NewWSProxy(":8081")
 	if err := proxy.Start(); err != nil {
 		log.Fatal("ListenAndServe error:", err)
 	}

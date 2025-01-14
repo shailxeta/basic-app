@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -35,6 +36,7 @@ var (
 	serviceDiscoveryClient *servicediscovery.ServiceDiscovery
 	serviceID              string
 	instanceID             string
+	publicIP               string // Add publicIP variable
 	namespaceId            string
 )
 
@@ -70,6 +72,46 @@ func init() {
 	}
 	log.Printf("Hostname: %s - instanceId: %s, serviceId: %s", hostname, instanceID, serviceID)
 
+	metadataURL := os.Getenv("ECS_CONTAINER_METADATA_URI_V4") + "/task"
+	resp, err := http.Get(metadataURL)
+	if err != nil {
+		log.Fatalf("failed to get task metadata: %w", err)
+	}
+	defer resp.Body.Close()
+
+	//var metadata struct {
+	//	Containers []struct {
+	//		Networks []struct {
+	//			IPv4Addresses        []string `json:"IPv4Addresses"`
+	//			PublicIPv4Address    string   `json:"PublicIPv4Address"` // Get public IP here
+	//			ServiceDiscoveryInfo []struct {
+	//				InstanceId string `json:"InstanceId"`
+	//			} `json:"ServiceDiscoveryInfo"`
+	//		} `json:"Networks"`
+	//	} `json:"Containers"`
+	//}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		log.Fatalf("failed to read task metadata: %v", err)
+	}
+	log.Printf("Task metadata response: %s", string(body))
+	//if err := json.NewDecoder(resp.Body).Decode(&metadata); err != nil {
+	//	log.Fatalf("failed to decode task metadata: %w", err)
+	//}
+	//
+	//if len(metadata.Containers) == 0 || len(metadata.Containers[0].Networks) == 0 {
+	//	log.Fatalf("networks not found in metadata")
+	//}
+	//
+	//instanceID = metadata.Containers[0].Networks[0].ServiceDiscoveryInfo[0].InstanceId
+	//
+	//ipAddress := metadata.Containers[0].Networks[0].IPv4Addresses[0]
+	//publicIP = metadata.Containers[0].Networks[0].PublicIPv4Address // Assign public IP
+	//
+	//fmt.Println("public ip:", publicIP)     // Add this line for debugging
+	//fmt.Println("private ip:", ipAddress)   // Add this line for debugging
+	//fmt.Println("instance id:", instanceID) // Add this line for debugging
 	// Start stats monitoring goroutine
 	go monitorStats()
 }
@@ -127,6 +169,7 @@ func updateServiceDiscovery(connections int32) {
 		attributes = make(map[string]*string)
 	}
 	attributes["ACTIVE_CONNECTIONS"] = aws.String(fmt.Sprintf("%d", connections))
+	attributes["AWS_INSTANCE_PUBLIC_IPV4"] = aws.String(fmt.Sprintf("%d", connections))
 
 	_, err = serviceDiscoveryClient.RegisterInstance(&servicediscovery.RegisterInstanceInput{
 		ServiceId:  aws.String(serviceID),
