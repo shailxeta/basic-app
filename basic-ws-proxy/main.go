@@ -7,18 +7,27 @@ import (
 	"os"
 )
 
-var (
-	// Target load balancer URL
-	targetURL = func() string {
-		if url := os.Getenv("TARGET_URL"); url != "" {
-			return url
-		}
-		return "ws://localhost:8080/ws"
-	}()
-)
+type WSProxy struct {
+	targetURL  string
+	serverAddr string
+}
 
-func proxyHandler(w http.ResponseWriter, r *http.Request) {
-	target, err := url.Parse(targetURL)
+func NewWSProxy(targetURL, serverAddr string) *WSProxy {
+	return &WSProxy{
+		targetURL:  targetURL,
+		serverAddr: serverAddr,
+	}
+}
+
+func getTargetURL() string {
+	if url := os.Getenv("TARGET_URL"); url != "" {
+		return url
+	}
+	return "ws://localhost:8080/ws"
+}
+
+func (p *WSProxy) proxyHandler(w http.ResponseWriter, r *http.Request) {
+	target, err := url.Parse(p.targetURL)
 	if err != nil {
 		log.Printf("Failed to parse target URL: %v", err)
 		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
@@ -41,20 +50,24 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	http.Redirect(w, r, redirectUrl.String(), http.StatusTemporaryRedirect)
+}
 
-	// Serve the request
-	//proxy.ServeHTTP(w, r)
-	//log.Println("Request served")
+func (p *WSProxy) healthHandler(w http.ResponseWriter, r *http.Request) {
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte("OK"))
+}
+
+func (p *WSProxy) Start() error {
+	http.HandleFunc("/ws", p.proxyHandler)
+	http.HandleFunc("/health", p.healthHandler)
+
+	log.Printf("Starting WebSocket proxy server on %s", p.serverAddr)
+	return http.ListenAndServe(p.serverAddr, nil)
 }
 
 func main() {
-	// Configure the HTTP server
-	http.HandleFunc("/ws", proxyHandler)
-
-	// Start the server
-	serverAddr := ":8081"
-	log.Printf("Starting WebSocket proxy server on %s", serverAddr)
-	if err := http.ListenAndServe(serverAddr, nil); err != nil {
+	proxy := NewWSProxy(getTargetURL(), ":8080")
+	if err := proxy.Start(); err != nil {
 		log.Fatal("ListenAndServe error:", err)
 	}
 }
