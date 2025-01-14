@@ -12,10 +12,9 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/aws/aws-sdk-go/service/ec2"
-
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/session"
+	"github.com/aws/aws-sdk-go/service/ec2"
 	"github.com/aws/aws-sdk-go/service/servicediscovery"
 	"github.com/gorilla/mux"
 	"github.com/gorilla/websocket"
@@ -29,21 +28,24 @@ const (
 
 // Global variables
 var (
-	activeConnection           int32 // Using atomic int32 for thread-safe operations
-	droppedRequests            int32
-	cummulativeDroppedRequests int64
-	lastDroppedRequestLog      time.Time
-	hostname, _                = os.Hostname()
+	// Connection tracking
+	activeConnection          int32 // Using atomic int32 for thread-safe operations
+	droppedRequests           int32
+	cumulativeDroppedRequests int64
+	lastDroppedRequestLog     time.Time
+
+	// Server info
+	hostname, _ = os.Hostname()
 
 	// AWS Service Discovery related
 	serviceDiscoveryClient *servicediscovery.ServiceDiscovery
 	serviceID              string
 	instanceID             string
-	publicIP               string // Add publicIP variable
+	publicIP               string
 	namespaceId            string
 )
 
-// WebSocket upgrader configuration
+// WebSocket configuration
 var upgrader = websocket.Upgrader{
 	ReadBufferSize:  1024,
 	WriteBufferSize: 1024,
@@ -52,7 +54,13 @@ var upgrader = websocket.Upgrader{
 	},
 }
 
+// Initialization
 func init() {
+	initializeAWS()
+	go monitorStats()
+}
+
+func initializeAWS() {
 	// Initialize AWS Service Discovery client
 	sess := session.Must(session.NewSession())
 	serviceDiscoveryClient = servicediscovery.New(sess)
@@ -73,40 +81,18 @@ func init() {
 	if serviceID == "" || instanceID == "" {
 		log.Printf("Hostname: %s - SERVICE_ID and INSTANCE_ID environment variables must be set", hostname)
 	}
-	log.Printf("Hostname: %s - instanceId: %s, serviceId: %s", hostname, instanceID, serviceID)
 
-	//var metadata struct {
-	//	Containers []struct {
-	//		Networks []struct {
-	//			IPv4Addresses        []string `json:"IPv4Addresses"`
-	//			PublicIPv4Address    string   `json:"PublicIPv4Address"` // Get public IP here
-	//			ServiceDiscoveryInfo []struct {
-	//				InstanceId string `json:"InstanceId"`
-	//			} `json:"ServiceDiscoveryInfo"`
-	//		} `json:"Networks"`
-	//	} `json:"Containers"`
-	//}
+	// Get public IP
+	var err error
+	publicIP, err = getPublicIPFromPrivateIP()
+	if err != nil {
+		log.Printf("Failed to get public IP: %v", err)
+	}
 
-	//if err := json.NewDecoder(resp.Body).Decode(&metadata); err != nil {
-	//	log.Fatalf("failed to decode task metadata: %w", err)
-	//}
-	//
-	//if len(metadata.Containers) == 0 || len(metadata.Containers[0].Networks) == 0 {
-	//	log.Fatalf("networks not found in metadata")
-	//}
-	//
-	//instanceID = metadata.Containers[0].Networks[0].ServiceDiscoveryInfo[0].InstanceId
-	//
-	//ipAddress := metadata.Containers[0].Networks[0].IPv4Addresses[0]
-	//publicIP = metadata.Containers[0].Networks[0].PublicIPv4Address // Assign public IP
-	//
-	//fmt.Println("public ip:", publicIP)     // Add this line for debugging
-	//fmt.Println("private ip:", ipAddress)   // Add this line for debugging
-	//fmt.Println("instance id:", instanceID) // Add this line for debugging
-	// Start stats monitoring goroutine
-	go monitorStats()
+	log.Printf("Hostname: %s - instanceId: %s, namespaceId: %s, serviceId: %s, publicIP: %s", hostname, instanceID, namespaceId, serviceID, publicIP)
 }
 
+// Monitoring and stats
 func monitorStats() {
 	ticker := time.NewTicker(statsLogDuration * time.Second)
 	for range ticker.C {
@@ -123,12 +109,12 @@ func monitorStats() {
 
 		// Log stats
 		log.Printf("Hostname: %s - Stats - Memory utilization: %d%%, CPU utilization: %f, Active connections: %d, Dropped requests %d, Cumulative Dropped Requests: %d",
-			hostname, memoryUtilizationPercent, cpuUsage, connections, droppedRequests, cummulativeDroppedRequests)
+			hostname, memoryUtilizationPercent, cpuUsage, connections, droppedRequests, cumulativeDroppedRequests)
 
 		// Reset counters
 		atomic.StoreInt32(&droppedRequests, 0)
-		if atomic.LoadInt64(&cummulativeDroppedRequests) > (1<<63 - 1000000) {
-			atomic.StoreInt64(&cummulativeDroppedRequests, 0)
+		if atomic.LoadInt64(&cumulativeDroppedRequests) > (1<<63 - 1000000) {
+			atomic.StoreInt64(&cumulativeDroppedRequests, 0)
 		}
 	}
 }
@@ -145,6 +131,7 @@ func calculateCPUUsage() float64 {
 	return cpuUsage
 }
 
+// AWS Service Discovery functions
 func getPublicIPFromPrivateIP() (string, error) {
 	metadataURI := os.Getenv("ECS_CONTAINER_METADATA_URI_V4")
 	if metadataURI == "" {
@@ -185,16 +172,13 @@ func getPublicIPFromPrivateIP() (string, error) {
 		return "", fmt.Errorf("no private IP found in metadata")
 	}
 
-	// Use private IP to get public IP
 	return getPublicIPFromEC2(privateIP)
 }
 
 func getPublicIPFromEC2(privateIP string) (string, error) {
-	// Initialize AWS SDK session
 	sess := session.Must(session.NewSession())
 	ec2Client := ec2.New(sess)
 
-	// Describe ENI using the private IP
 	result, err := ec2Client.DescribeNetworkInterfaces(&ec2.DescribeNetworkInterfacesInput{
 		Filters: []*ec2.Filter{
 			{
@@ -218,26 +202,11 @@ func getPublicIPFromEC2(privateIP string) (string, error) {
 }
 
 func updateServiceDiscovery(connections int32) {
-	ip, err := getPublicIPFromPrivateIP()
-	log.Printf("publicIP: %s", ip)
-
-	getInstanceResp, err := serviceDiscoveryClient.GetInstance(&servicediscovery.GetInstanceInput{
-		ServiceId:  aws.String(serviceID),
-		InstanceId: aws.String(instanceID),
-	})
-	if err != nil {
-		log.Printf("Failed to get instance: %v", err)
-		return
-	}
-
-	attributes := getInstanceResp.Instance.Attributes
-	if attributes == nil {
-		attributes = make(map[string]*string)
-	}
+	attributes := make(map[string]*string)
 	attributes["ACTIVE_CONNECTIONS"] = aws.String(fmt.Sprintf("%d", connections))
-	attributes["INSTANCE_PUBLIC_IPV4"] = aws.String(ip)
+	attributes["INSTANCE_PUBLIC_IPV4"] = aws.String(publicIP)
 
-	_, err = serviceDiscoveryClient.RegisterInstance(&servicediscovery.RegisterInstanceInput{
+	_, err := serviceDiscoveryClient.RegisterInstance(&servicediscovery.RegisterInstanceInput{
 		ServiceId:  aws.String(serviceID),
 		InstanceId: aws.String(instanceID),
 		Attributes: attributes,
@@ -247,11 +216,12 @@ func updateServiceDiscovery(connections int32) {
 	}
 }
 
+// Connection handling
 func handleConnections(w http.ResponseWriter, r *http.Request) {
 	if !checkMemoryUsage() {
 		http.Error(w, "Service Unavailable", http.StatusServiceUnavailable)
 		atomic.AddInt32(&droppedRequests, 1)
-		atomic.AddInt64(&cummulativeDroppedRequests, 1)
+		atomic.AddInt64(&cumulativeDroppedRequests, 1)
 		return
 	}
 
