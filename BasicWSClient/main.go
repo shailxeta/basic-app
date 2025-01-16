@@ -198,7 +198,7 @@ func main() {
 	}
 
 	fmt.Println("connecting...")
-	url := "ws://shailxeta-proxy-lb-240109791.us-west-2.elb.amazonaws.com/ws"
+	url := "ws://<lb-identifier>.us-west-2.elb.amazonaws.com/ws"
 	if len(os.Args) > 2 {
 		url = os.Args[2]
 	}
